@@ -1,0 +1,153 @@
+package org.lqzs.sorene.io;
+
+import android.content.ContentResolver;
+import android.util.Log;
+
+import androidx.documentfile.provider.DocumentFile;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+
+import static org.lqzs.sorene.Sorene.LOG_TAG;
+
+public class DirectoryReader extends Thread {
+	private final ProgressReporter reporter;
+	private final ContentResolver resolver;
+	private final DocumentFile root;
+	private final String[] files;
+	private final Channel out;
+	private final BufferPool bufferPool;
+	private boolean success = false;
+
+	public DirectoryReader(ContentResolver resolver, DocumentFile root, String[] files, Channel out,
+	                       ProgressReporter reporter, BufferPool bufferPool) {
+		this.resolver = resolver;
+		this.root = root;
+		this.files = files;
+		this.out = out;
+		this.reporter = reporter;
+		this.bufferPool = bufferPool;
+	}
+
+	public boolean isSuccess() {
+		return success;
+	}
+
+	private void sendDir(final DocumentFile dir, final String basePath) throws IOException, InterruptedException {
+		if (!dir.exists()) {
+			return;
+		}
+		String pathStr = dir.getName();
+		if (pathStr == null) {
+			return;
+		}
+		if (pathStr.startsWith(".")) {
+			return; // ignore hidden
+		}
+		if (basePath.length() > 0) {
+			pathStr = basePath + "/" + pathStr;
+		}
+		Log.d(LOG_TAG, "Now at: " + pathStr);
+		byte[] path = pathStr.getBytes(StandardCharsets.UTF_8);
+		final ByteBuffer header = bufferPool.pop();
+		header.order(ByteOrder.BIG_ENDIAN)
+				.putInt(path.length)
+				.putLong(-1) // directory
+				.put(path)
+				.flip();
+		out.write(header);
+		for (DocumentFile f : dir.listFiles()) {
+			if (f.isFile()) {
+				sendFile(f, pathStr);
+			} else if (f.isDirectory()) {
+				sendDir(f, pathStr);
+			}
+		}
+	}
+
+	private void sendFile(final DocumentFile file, final String basePath) throws IOException, InterruptedException {
+		if (!file.exists() || !file.canRead()) {
+			return;
+		}
+		String pathStr = file.getName();
+		if (pathStr == null) {
+			return;
+		}
+		if (pathStr.startsWith(".")) {
+			return; // ignore hidden
+		}
+		if (basePath.length() > 0) {
+			pathStr = basePath + "/" + pathStr;
+		}
+		final byte[] path = pathStr.getBytes(StandardCharsets.UTF_8);
+		final long length = file.length();
+		final ByteBuffer header = bufferPool.pop();
+		header.order(ByteOrder.BIG_ENDIAN)
+				.putInt(path.length)
+				.putLong(length)
+				.put(path)
+				.flip();
+		out.write(header);
+		final String name = file.getName();
+		Log.d(LOG_TAG, "sendFile: " + name + " length=" + length);
+		try (final InputStream in = resolver.openInputStream(file.getUri())) {
+			if (in == null) {
+				throw new IOException("can't open input stream");
+			}
+			long pos = 0;
+			reporter.report(name, 0, 0);
+			if (length > 0) {
+				while (true) {
+					ByteBuffer buf = bufferPool.pop();
+					while (buf.remaining() > 0) {
+						int read = in.read(buf.array(), buf.arrayOffset() + buf.position(), buf.remaining());
+						if (read < 0) {
+							break;
+						}
+						buf.position(buf.position() + read);
+					}
+					buf.flip();
+					if (buf.limit() < 1) {
+						bufferPool.push(buf);
+						break;
+					}
+					pos += buf.limit();
+					out.write(buf);
+					reporter.report(name, pos, length);
+				}
+			}
+		}
+	}
+
+	@Override
+	public void run() {
+		try {
+			for (String file : files) {
+				DocumentFile entry = root.findFile(file);
+				if (entry != null) {
+					if (entry.isDirectory()) {
+						sendDir(entry, "");
+					} else if (entry.isFile()) {
+						sendFile(entry, "");
+					}
+				}
+			}
+			reporter.report(null, 0, 0);
+			ByteBuffer buffer = bufferPool.pop();
+			buffer.putInt(0)
+					.putLong(0)
+					.flip();
+			out.write(buffer);
+			out.close();
+			success = true;
+			Log.d(LOG_TAG, "DirectoryReader finished normally");
+		} catch (IOException e) {
+			Log.e(LOG_TAG, "DirectoryReader", e);
+		} catch (InterruptedException e) {
+			Log.e(LOG_TAG, "DirectoryReader Interrupted", e);
+		}
+	}
+}
